@@ -1,8 +1,9 @@
 import os
 import feedparser
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 import time
+import aiohttp
+import asyncio
 
 # Configuration du logger pour afficher les messages d'information et d'erreur
 logging.basicConfig(
@@ -22,7 +23,6 @@ def charger_flux(filepath):
     """
     try:
         with open(filepath, "r", encoding="utf-8") as f:
-            # On enlève les lignes vides et les espaces inutiles
             return [line.strip() for line in f if line.strip()]
     except FileNotFoundError:
         logging.error(f"Fichier introuvable : {filepath}")
@@ -40,7 +40,6 @@ def charger_mots_cles(filepath):
     """
     try:
         with open(filepath, "r", encoding="utf-8") as f:
-            # On convertit tout en minuscules pour éviter les problèmes de casse
             return [line.strip().lower() for line in f if line.strip()]
     except FileNotFoundError:
         logging.error(f"Fichier introuvable : {filepath}")
@@ -57,59 +56,72 @@ def article_match(entry, keywords):
     Returns:
         str: Le mot-clé trouvé dans l'article, ou None si aucun mot-clé ne correspond.
     """
-    # On combine le titre et la description pour maximiser les chances de correspondance
     content = (entry.title + " " + entry.get("description", "")).lower()
     for keyword in keywords:
         if keyword in content:
             return keyword
     return None
 
-def analyse_flux(url, keywords):
+async def fetch_feed(session, url):
+    """
+    Récupère le contenu d'un flux RSS de manière asynchrone.
+
+    Args:
+        session (aiohttp.ClientSession): Session HTTP asynchrone.
+        url (str): URL du flux RSS.
+
+    Returns:
+        dict: Le contenu du flux RSS analysé.
+    """
+    try:
+        async with session.get(url) as response:
+            content = await response.text()
+            return feedparser.parse(content)
+    except Exception as e:
+        logging.warning(f"Erreur lors de la récupération du flux {url} : {e}")
+        return None
+
+async def analyse_flux(url, keywords, session):
     """
     Analyse un flux RSS et retourne les articles correspondant aux mots-clés.
 
     Args:
         url (str): URL du flux RSS.
         keywords (list): Liste des mots-clés.
+        session (aiohttp.ClientSession): Session HTTP asynchrone.
 
     Returns:
         list: Une liste d'articles correspondant aux mots-clés.
     """
-    try:
-        feed = feedparser.parse(url)
-        matched = []
-        for entry in feed.entries:
-            if not hasattr(entry, 'title'):
-                # Si l'article n'a pas de titre, on passe
-                continue
-            keyword = article_match(entry, keywords)
-            if keyword:
-                # On ajoute les infos importantes de l'article
-                matched.append({
-                    "title": entry.title,
-                    "published": entry.get("published", "Date inconnue"),
-                    "link": entry.link,
-                    "keyword": keyword
-                })
-        return matched
-    except Exception as e:
-        # Petite astuce : on loggue l'erreur mais on continue
-        logging.warning(f"Erreur lors du traitement de {url} : {e}")
+    feed = await fetch_feed(session, url)
+    if not feed:
         return []
 
-def main():
+    matched = []
+    for entry in feed.entries:
+        if not hasattr(entry, 'title'):
+            continue
+        keyword = article_match(entry, keywords)
+        if keyword:
+            matched.append({
+                "title": entry.title,
+                "published": entry.get("published", "Date inconnue"),
+                "link": entry.link,
+                "keyword": keyword
+            })
+    return matched
+
+async def main():
     """
     Fonction principale du script. Elle charge les données, traite les flux RSS
     et sauvegarde les résultats dans un fichier.
     """
-    # Mesure du temps de démarrage
     start_time = time.time()
 
     # Chargement des fichiers d'entrée
     rss_urls = charger_flux("rss_list.txt")
     keywords = charger_mots_cles("mots_cles.txt")
 
-    # Vérification des données d'entrée
     if not rss_urls or not keywords:
         logging.error("Les fichiers d'entrée sont manquants ou vides.")
         return
@@ -118,15 +130,11 @@ def main():
     logging.info(f"Mots-clés utilisés : {keywords}")
 
     results = []
-    # Utilisation de ThreadPoolExecutor pour le traitement parallèle
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = [executor.submit(analyse_flux, url, keywords) for url in rss_urls]
-        for future in as_completed(futures):
-            try:
-                articles = future.result()
-                results.extend(articles)
-            except Exception as e:
-                logging.warning(f"Erreur dans un thread : {e}")
+    async with aiohttp.ClientSession() as session:
+        tasks = [analyse_flux(url, keywords, session) for url in rss_urls]
+        all_results = await asyncio.gather(*tasks)
+        for articles in all_results:
+            results.extend(articles)
 
     for article in results:
         print(f"[{article['keyword']}] {article['title']} ({article['published']})\n{article['link']}\n")
@@ -140,4 +148,4 @@ def main():
     logging.info(f"Temps total d'exécution : {elapsed_time:.2f} secondes.")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
